@@ -1,5 +1,6 @@
-functions-framework==3.*
+flask
 google-cloud-storage
-torchvision
-torch
-opencv-python-headless
+requests
+ultralytics
+opencv-python
+gunicorn

@@ -1,17 +1,57 @@
-import os
+import base64
+import json
+
 import cv2
 import numpy as np
 from ultralytics import YOLO
 import torch
-import functions_framework
 import os
 from google.cloud import storage
-
+import requests
+import os
 from utils import dibujar_color_checker
 from colorestarget import colores_target_bgr
 from utils import bgr_to_lab, rgbarray_to_lab
-print("CUDA disponible:", torch.cuda.is_available())
+import flask
 
+
+# crear app
+app = flask.Flask(__name__)
+
+def descargar_modelo(url, ruta_destino):
+
+
+    if os.path.exists(ruta_destino):
+        print(f"El modelo ya existe en {ruta_destino}")
+        return ruta_destino
+
+    print(f"Descargando modelo desde {url}...")
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+
+    total = int(response.headers.get('content-length', 0))
+    with open(ruta_destino, 'wb') as f:
+        if total == 0:
+            f.write(response.content)
+        else:
+            descargado = 0
+            for datos in response.iter_content(chunk_size=8192):
+                descargado += len(datos)
+                f.write(datos)
+                progreso = int(50 * descargado / total)
+                print(
+                    f"\r[{'=' * progreso}{' ' * (50 - progreso)}] {descargado / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MB",
+                    end='')
+    print(f"\nModelo guardado en {ruta_destino}")
+    return ruta_destino
+
+
+# URL y ruta del modelo
+modelo_url = "https://storage.googleapis.com/lythium-datasets-hot/colour-checker-detection-l-seg.pt"
+modelo_ruta = "colour-checker-detection-l-seg.pt"
+
+# Descargar el modelo
+modelo_ruta = descargar_modelo(modelo_url, modelo_ruta)
 
 def find_corners(points: np.ndarray) -> np.ndarray:
     """
@@ -176,64 +216,106 @@ def detect_colorchecker_with_ultralytics_video(video_path: str, model_path: str,
     else:
         print("No se registraron métricas Delta_E válidas.")
 
+@app.route('/', methods=['POST'])
+def index():
+    envelope = flask.request.get_json()
+    print(f"DEBUG: Received envelope: {json.dumps(envelope, indent=2)}")
+    if not envelope:
+        msg = "No Pub/Sub message received"
+        print(f"error: {msg}")
+        return f"Bad Request: {msg}", 400
 
+    if not isinstance(envelope, dict) or "message" not in envelope:
+        msg = "Invalid Pub/Sub message format"
+        print(f"error: {msg}")
+        return f"Bad Request: {msg}", 400
 
-@functions_framework.cloud_event
-def hello_gcs(cloud_event):
-    data = cloud_event.data
+    pubsub_message = envelope["message"]
 
-    event_id = cloud_event["id"]
-    event_type = cloud_event["type"]
-
-    bucket_name = data["bucket"]
-    file_name = data["name"]
-    metageneration = data["metageneration"]
-    timeCreated = data["timeCreated"]
-    updated = data["updated"]
-
-    print(f"Event ID: {event_id}")
-    print(f"Event type: {event_type}")
-    print(f"Bucket: {bucket_name}")
-    print(f"File: {file_name}")
-    print(f"Metageneration: {metageneration}")
-    print(f"Created: {timeCreated}")
-    print(f"Updated: {updated}")
-
-    # Comprobar si el archivo es .avi
-    if file_name.lower().endswith(".avi"):
-        print(f"Archivo AVI detectado: {file_name}")
-
+    if isinstance(pubsub_message, dict) and "data" in pubsub_message:
         try:
-            # Inicializar el cliente de Cloud Storage
-            storage_client = storage.Client()
-            bucket = storage_client.bucket(bucket_name)
-            blob = bucket.blob(file_name)
-
-            # Definir la ruta de destino en el sistema de archivos temporal de la Cloud Function
-            # Asegúrate de que el nombre del archivo no contenga caracteres inválidos para nombres de archivo.
-            # Podrías querer sanitizar `file_name` si puede contener rutas.
-            base_name = os.path.basename(file_name)
-            destination_file_name = f"/tmp/{base_name}"
-
-            # Descargar el archivo
-            blob.download_to_filename(destination_file_name)
-            print(f"Archivo {file_name} descargado a {destination_file_name}")
-            model_path = 'colour-checker-detection-l-seg.pt'
-            detect_colorchecker_with_ultralytics_video(
-                destination_file_name, model_path, guardar=True, mostrar=False)
-            print(f"Procesamiento completado para {file_name}.")
-
-
-
+            data_bytes = base64.b64decode(pubsub_message["data"])
+            data_str = data_bytes.decode("utf-8")
+            gcs_event_data = json.loads(data_str)
+            print(f"Datos del evento GCS recibidos: {gcs_event_data}")
 
         except Exception as e:
-            print(f"Error al descargar o procesar el archivo {file_name}: {e}")
+            msg = f"Error decodificando o parseando datos del mensaje Pub/Sub: {e}"
+            print(msg)
+            return f"Bad Request: {msg}", 400
+
+        bucket_name = gcs_event_data.get("bucket")
+        file_name = gcs_event_data.get("name")
+        # metageneration = gcs_event_data.get("metageneration") # Para referencia
+        # timeCreated = gcs_event_data.get("timeCreated") # Para referencia
+
+
+        if not bucket_name or not file_name:
+            msg = "Datos del evento GCS incompletos (falta bucket o name)."
+            print(msg)
+            return f"Bad Request: {msg}", 400
+
+        print(f"Evento para Bucket: {bucket_name}, Archivo: {file_name}")
+
+        if file_name.lower().endswith(".avi"):
+            print(f"Archivo AVI detectado: {file_name}")
+            try:
+                storage_client = storage.Client()
+                bucket_gcs = storage_client.bucket(bucket_name)
+                blob = bucket_gcs.blob(file_name)
+
+                base_name = os.path.basename(file_name)
+                destination_file_name = f"/tmp/{base_name}"
+
+                print(f"Descargando {file_name} de gs://{bucket_name} a {destination_file_name}...")
+                blob.download_to_filename(destination_file_name)
+                print(f"Archivo descargado exitosamente.")
+
+                # Llama a tu función de procesamiento.
+                # 'modelo_ruta' contiene la ruta al modelo descargado globalmente.
+                # Asumimos que detect_colorchecker_with_ultralytics_video está definida
+                # y maneja la lógica de 'guardar' y dónde guarda el archivo.
+                # Si necesitas el nombre del archivo procesado para subirlo,
+                # tu función detect_... debería retornarlo.
+                detect_colorchecker_with_ultralytics_video(
+                    video_path=destination_file_name,
+                    model_path=modelo_ruta, # Esta es la variable global con la ruta al modelo
+                    guardar=True,
+                    mostrar=False
+                )
+                print(f"Procesamiento de video completado para {file_name}.")
+
+                # (Opcional) Lógica para subir el video procesado de vuelta a GCS
+                # Si 'detect_colorchecker_with_ultralytics_video' guarda el archivo en una ruta conocida
+                # (ej. en /tmp/ con un sufijo _procesado), puedes subirlo aquí.
+                # Ejemplo:
+                # processed_video_local_path = f"/tmp/{os.path.splitext(base_name)[0]}_procesado.avi"
+                # if os.path.exists(processed_video_local_path):
+                #    processed_video_gcs_name = f"processed/{os.path.basename(processed_video_local_path)}"
+                #    output_blob = bucket_gcs.blob(processed_video_gcs_name)
+                #    output_blob.upload_from_filename(processed_video_local_path)
+                #    print(f"Video procesado subido a gs://{bucket_name}/{processed_video_gcs_name}")
+                #    os.remove(processed_video_local_path) # Limpiar archivo local procesado
+                # else:
+                #    print(f"Video procesado {processed_video_local_path} no encontrado para subir.")
+
+
+                if os.path.exists(destination_file_name): # Limpiar archivo local descargado
+                    os.remove(destination_file_name)
+
+                return flask.jsonify({"message": f"Procesamiento iniciado para {file_name}"}), 200
+
+            except Exception as e:
+                import traceback
+                error_msg = f"Error procesando el archivo {file_name}: {e}\n{traceback.format_exc()}"
+                print(error_msg)
+                return error_msg, 500
+        else:
+            msg = f"El archivo {file_name} no es .avi. Se omite el procesamiento."
+            print(msg)
+            return flask.jsonify({"message": msg, "file_processed": False}), 200
     else:
-        print(f"El archivo {file_name} no es un archivo .avi. Se omite la descarga.")
+        msg = "Formato de mensaje Pub/Sub inesperado (falta 'data')."
+        print(f"error: {msg}")
+        return f"Bad Request: {msg}", 400
 
-
-# if __name__ == "__main__":
-#     video_path = 'color_checker_25-05-26_11-18-16-064877__mowi-chacabuco.avi'
-#     #video_path = '24-11-08_18-07-29-185002__aq_calbuco.avi'
-#     model_path = 'colour-checker-detection-l-seg.pt'
-#     detect_colorchecker_with_ultralytics_video(video_path, model_path, guardar=False, mostrar=False)
