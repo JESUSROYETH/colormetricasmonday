@@ -218,104 +218,82 @@ def detect_colorchecker_with_ultralytics_video(video_path: str, model_path: str,
 
 @app.route('/', methods=['POST'])
 def index():
-    envelope = flask.request.get_json()
-    print(f"DEBUG: Received envelope: {json.dumps(envelope, indent=2)}")
-    if not envelope:
-        msg = "No Pub/Sub message received"
+    # Obtener el cuerpo JSON de la petición
+    gcs_event_data = flask.request.get_json(silent=True) # Usar silent=True
+
+    # --- LÍNEA DE DEBUG (puedes mantenerla o quitarla después de confirmar) ---
+    print(f"DEBUG: Received GCS event data: {json.dumps(gcs_event_data, indent=2)}")
+    # --- FIN DE LÍNEA DE DEBUG ---
+
+    if not gcs_event_data:
+        msg = "No GCS event data received or request is not JSON."
         print(f"error: {msg}")
         return f"Bad Request: {msg}", 400
 
-    if not isinstance(envelope, dict) or "message" not in envelope:
-        msg = "Invalid Pub/Sub message format"
+    # Ahora trabajamos directamente con gcs_event_data
+    # Ya no necesitamos buscar "message" ni "data" dentro de él, ni decodificar Base64
+
+    bucket_name = gcs_event_data.get("bucket")
+    file_name = gcs_event_data.get("name") # El campo 'name' ya incluye la ruta completa dentro del bucket
+
+    if not bucket_name or not file_name:
+        msg = "GCS event data is incomplete (missing 'bucket' or 'name' key)."
         print(f"error: {msg}")
         return f"Bad Request: {msg}", 400
 
-    pubsub_message = envelope["message"]
+    print(f"Evento para Bucket: {bucket_name}, Archivo: {file_name}")
 
-    if isinstance(pubsub_message, dict) and "data" in pubsub_message:
+    if file_name.lower().endswith(".avi"):
+        print(f"Archivo AVI detectado: {file_name}")
         try:
-            data_bytes = base64.b64decode(pubsub_message["data"])
-            data_str = data_bytes.decode("utf-8")
-            gcs_event_data = json.loads(data_str)
-            print(f"Datos del evento GCS recibidos: {gcs_event_data}")
+            storage_client = storage.Client()
+            # El bucket_name ya lo tenemos de gcs_event_data
+            bucket_gcs = storage_client.bucket(bucket_name)
+            # El file_name ya lo tenemos de gcs_event_data
+            blob = bucket_gcs.blob(file_name)
+
+            # Para el nombre del archivo local, solo usamos la parte final del nombre del archivo GCS
+            local_base_name = os.path.basename(file_name)
+            destination_file_name = f"/tmp/{local_base_name}"
+
+            print(f"Descargando {file_name} de gs://{bucket_name} a {destination_file_name}...")
+            blob.download_to_filename(destination_file_name)
+            print(f"Archivo descargado exitosamente.")
+
+            detect_colorchecker_with_ultralytics_video(
+                video_path=destination_file_name,
+                model_path=modelo_ruta, # Variable global con la ruta al modelo
+                guardar=True,
+                mostrar=False
+            )
+            print(f"Procesamiento de video completado para {file_name}.")
+
+            # (Opcional) Lógica para subir el video procesado
+            # Asegúrate que el path del video procesado sea correcto
+            processed_video_local_path = f"/tmp/{os.path.splitext(local_base_name)[0]}_procesado.avi"
+            if os.path.exists(processed_video_local_path):
+                # Define una carpeta de salida en GCS para los videos procesados
+                # y usa el nombre base del archivo procesado.
+                processed_video_gcs_name = f"processed_videos/{os.path.basename(processed_video_local_path)}"
+                output_blob = bucket_gcs.blob(processed_video_gcs_name)
+                output_blob.upload_from_filename(processed_video_local_path)
+                print(f"Video procesado subido a gs://{bucket_name}/{processed_video_gcs_name}")
+                os.remove(processed_video_local_path)
+            else:
+                print(f"Video procesado {processed_video_local_path} no encontrado para subir.")
+
+            if os.path.exists(destination_file_name):
+                os.remove(destination_file_name)
+
+            return flask.jsonify({"message": f"Procesamiento completado para {file_name}"}), 200
 
         except Exception as e:
-            msg = f"Error decodificando o parseando datos del mensaje Pub/Sub: {e}"
-            print(msg)
-            return f"Bad Request: {msg}", 400
-
-        bucket_name = gcs_event_data.get("bucket")
-        file_name = gcs_event_data.get("name")
-        # metageneration = gcs_event_data.get("metageneration") # Para referencia
-        # timeCreated = gcs_event_data.get("timeCreated") # Para referencia
-
-
-        if not bucket_name or not file_name:
-            msg = "Datos del evento GCS incompletos (falta bucket o name)."
-            print(msg)
-            return f"Bad Request: {msg}", 400
-
-        print(f"Evento para Bucket: {bucket_name}, Archivo: {file_name}")
-
-        if file_name.lower().endswith(".avi"):
-            print(f"Archivo AVI detectado: {file_name}")
-            try:
-                storage_client = storage.Client()
-                bucket_gcs = storage_client.bucket(bucket_name)
-                blob = bucket_gcs.blob(file_name)
-
-                base_name = os.path.basename(file_name)
-                destination_file_name = f"/tmp/{base_name}"
-
-                print(f"Descargando {file_name} de gs://{bucket_name} a {destination_file_name}...")
-                blob.download_to_filename(destination_file_name)
-                print(f"Archivo descargado exitosamente.")
-
-                # Llama a tu función de procesamiento.
-                # 'modelo_ruta' contiene la ruta al modelo descargado globalmente.
-                # Asumimos que detect_colorchecker_with_ultralytics_video está definida
-                # y maneja la lógica de 'guardar' y dónde guarda el archivo.
-                # Si necesitas el nombre del archivo procesado para subirlo,
-                # tu función detect_... debería retornarlo.
-                detect_colorchecker_with_ultralytics_video(
-                    video_path=destination_file_name,
-                    model_path=modelo_ruta, # Esta es la variable global con la ruta al modelo
-                    guardar=True,
-                    mostrar=False
-                )
-                print(f"Procesamiento de video completado para {file_name}.")
-
-                # (Opcional) Lógica para subir el video procesado de vuelta a GCS
-                # Si 'detect_colorchecker_with_ultralytics_video' guarda el archivo en una ruta conocida
-                # (ej. en /tmp/ con un sufijo _procesado), puedes subirlo aquí.
-                # Ejemplo:
-                # processed_video_local_path = f"/tmp/{os.path.splitext(base_name)[0]}_procesado.avi"
-                # if os.path.exists(processed_video_local_path):
-                #    processed_video_gcs_name = f"processed/{os.path.basename(processed_video_local_path)}"
-                #    output_blob = bucket_gcs.blob(processed_video_gcs_name)
-                #    output_blob.upload_from_filename(processed_video_local_path)
-                #    print(f"Video procesado subido a gs://{bucket_name}/{processed_video_gcs_name}")
-                #    os.remove(processed_video_local_path) # Limpiar archivo local procesado
-                # else:
-                #    print(f"Video procesado {processed_video_local_path} no encontrado para subir.")
-
-
-                if os.path.exists(destination_file_name): # Limpiar archivo local descargado
-                    os.remove(destination_file_name)
-
-                return flask.jsonify({"message": f"Procesamiento iniciado para {file_name}"}), 200
-
-            except Exception as e:
-                import traceback
-                error_msg = f"Error procesando el archivo {file_name}: {e}\n{traceback.format_exc()}"
-                print(error_msg)
-                return error_msg, 500
-        else:
-            msg = f"El archivo {file_name} no es .avi. Se omite el procesamiento."
-            print(msg)
-            return flask.jsonify({"message": msg, "file_processed": False}), 200
+            import traceback
+            error_msg = f"Error procesando el archivo {file_name}: {e}\n{traceback.format_exc()}"
+            print(f"CRITICAL_ERROR: {error_msg}")
+            return error_msg, 500
     else:
-        msg = "Formato de mensaje Pub/Sub inesperado (falta 'data')."
-        print(f"error: {msg}")
-        return f"Bad Request: {msg}", 400
+        msg = f"El archivo {file_name} no es .avi. Se omite el procesamiento."
+        print(msg)
+        return flask.jsonify({"message": msg, "file_processed": False}), 200
 
