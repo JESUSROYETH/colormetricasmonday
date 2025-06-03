@@ -39,4 +39,4 @@ EXPOSE 8080
 # --workers: ajusta según los recursos de tu instancia de Cloud Run y la naturaleza de tu app.
 # --threads: útil si tu código es I/O bound o usa bibliotecas que liberan el GIL.
 # --timeout 0: para procesos potencialmente largos como el procesamiento de video. Considera un valor alto en lugar de 0 si es posible.
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "main:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--timeout", "0", "main:app"]
